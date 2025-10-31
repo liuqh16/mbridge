@@ -29,4 +29,5 @@ from .glm4moe import GLM4MoEBridge
 from .glm4_vl import Glm4VLBridgeMoe, Glm4VLBridgeDense
 from .gemma3 import Gemma3Bridge
 from .internvl3 import InternVL3Bridge
-from .qwen3_vl import Qwen3VLBridge, Qwen3VLBridge
+from .qwen3_vl import Qwen3VLBridge, Qwen3VLMoEBridge
+from .qwen3_omni_moe import Qwen3OmniMoeThinkerBridge

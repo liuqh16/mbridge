@@ -1,0 +1,415 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024 Alibaba PAI Team.
+
+"""Qwen3OmniMoe Thinker Model"""
+
+import logging
+
+import torch
+from megatron.core import InferenceParams, mpu, tensor_parallel
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.spec_utils import ModuleSpec
+
+from mbridge.models.qwen3_vl.attention import Qwen3VLSelfAttention
+from mbridge.models.qwen3_vl.gpt_model import Qwen3VLGPTModel
+from mbridge.models.qwen3_vl.rope_utils import get_rope_index
+from mbridge.models.qwen3_vl.utils import split_deepstack_embs
+from mbridge.models.qwen3_vl.vision_model import Qwen3VLVisionModel
+
+from mbridge.models.qwen3_omni_moe.audio_encoder import Qwen3OmniMoeAudioEncoder
+from mbridge.models.qwen3_omni_moe.transformer_config import Qwen3OmniMoeTransformerConfig
+
+from mbridge.core.util import (
+    qwen3vl_cp_split,
+    get_vision_cp_data,
+    AllGatherVisionEmbeddings,
+    split_data_cp_rank,
+)
+
+
+class Qwen3OmniMoeThinkerModel(MegatronModule):
+    """Qwen3OmniMoe Thinker multi-modal model.
+
+    Similar to Qwen3VLModel but with added audio encoder support.
+
+    Args:
+        language_transformer_config: Transformer config for the language model.
+        language_transformer_layer_spec: Specifies module to use for transformer layers of the
+            language model.
+        language_vocab_size: Language model vocabulary size.
+        language_max_sequence_length: Language model maximum sequence length.
+        vision_transformer_config: Transformer config for the vision model.
+        vision_transformer_layer_spec: Specifies module to use for transformer layers of the
+            vision model.
+        vision_patch_merger_spec: Specifies the module to use for the vision projection.
+        parallel_output: Do not gather the outputs, keep them split across tensor parallel ranks.
+        language_rotary_percent: Percent of rotary dimension to use for rotary position embeddings.
+        pre_process: Include the embedding layer in the gpt decoder.
+        post_process: Include an output layer and a layernorm in the gpt decoder.
+        add_encoder: Construct the encoder module.
+        add_decoder: Construct the decoder module.
+        language_rotary_base: Rotary base for language model.
+        fp16_lm_cross_entropy: Use FP16 for cross entropy.
+        language_share_embeddings_and_output_weights: Share embeddings and output weights.
+        image_token_id: Token ID for image placeholder.
+        video_token_id: Token ID for video placeholder.
+        vision_start_token_id: Token ID for vision start marker.
+        audio_token_id: Token ID for audio placeholder.
+    """
+
+    def __init__(
+        self,
+        language_transformer_config: Qwen3OmniMoeTransformerConfig,
+        language_transformer_layer_spec: ModuleSpec,
+        language_vocab_size: int,
+        language_max_sequence_length: int,
+        vision_transformer_config: Qwen3OmniMoeTransformerConfig,
+        vision_transformer_layer_spec: ModuleSpec,
+        vision_patch_merger_spec: ModuleSpec,
+        parallel_output: bool = True,
+        language_rotary_percent: float = 1.0,
+        pre_process: bool = True,
+        post_process: bool = True,
+        add_encoder: bool = True,
+        add_decoder: bool = True,
+        language_rotary_base: int = 10000,
+        fp16_lm_cross_entropy: bool = False,
+        language_share_embeddings_and_output_weights: bool = False,
+        image_token_id: int = 151655,
+        video_token_id: int = 151656,
+        vision_start_token_id: int = 151652,
+        audio_token_id: int = 151664,
+    ) -> None:
+        super().__init__(config=language_transformer_config)
+
+        # Patch self_attention to use qwen3vl attention
+        vision_transformer_layer_spec.submodules.self_attention.module = Qwen3VLSelfAttention
+        for layer_spec in language_transformer_layer_spec.layer_specs:
+            layer_spec.submodules.self_attention.module = Qwen3VLSelfAttention
+
+        logging.getLogger(__name__).warning(
+            "Qwen3OmniMoe Thinker model is under development and may be missing features."
+        )
+
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.add_encoder = add_encoder
+        self.add_decoder = add_decoder
+
+        self.encoder_hidden_state = None
+        self.vision_model = None
+        self.audio_encoder = None
+        self.language_model = None
+
+        self.image_token_id = image_token_id
+        self.video_token_id = video_token_id
+        self.vision_start_token_id = vision_start_token_id
+        self.audio_token_id = audio_token_id
+
+        self.square_merge_size = vision_transformer_config.spatial_merge_size**2
+
+        # This attribute is needed to check if an all-reduce is required
+        self.share_embeddings_and_output_weights = False
+
+        if self.pre_process:
+            # Vision model (reuse Qwen3VL vision model)
+            self.vision_model = Qwen3VLVisionModel(
+                vision_transformer_config,
+                vision_transformer_layer_spec,
+                vision_patch_merger_spec,
+                pre_process=True,
+                post_process=True,
+            )
+
+            # Audio encoder (new for OmniMoe)
+            self.audio_encoder = Qwen3OmniMoeAudioEncoder(
+                language_transformer_config,
+            )
+
+        # Language model (reuse Qwen3VL GPT model)
+        self.language_model = Qwen3VLGPTModel(
+            config=language_transformer_config,
+            transformer_layer_spec=language_transformer_layer_spec,
+            vocab_size=language_vocab_size,
+            max_sequence_length=language_max_sequence_length,
+            parallel_output=parallel_output,
+            position_embedding_type="mrope",
+            rotary_percent=language_rotary_percent,
+            pre_process=self.pre_process,
+            post_process=self.post_process,
+            rotary_base=language_rotary_base,
+            fp16_lm_cross_entropy=fp16_lm_cross_entropy,
+            share_embeddings_and_output_weights=language_share_embeddings_and_output_weights,
+            scatter_embedding_sequence_parallel=False,
+        )
+
+        assert len(vision_transformer_config.deepstack_visual_indexes) < len(self.language_model.decoder.layers), (
+            "the deepstack_visual_embeds should on the first pp-stage"
+        )
+
+        self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
+
+    def shared_embedding_or_output_weight(self):
+        """Convenience method to surface the language model's word embeddings."""
+        if self.add_decoder:
+            return self.language_model.shared_embedding_or_output_weight()
+        return None
+
+    def set_input_tensor(self, input_tensor) -> None:
+        """Set input tensor for pipeline parallelism."""
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+        assert len(input_tensor) == 1, "input_tensor should only be length 1 for Qwen3OmniMoe"
+
+        if self.pre_process:
+            self.encoder_hidden_state = input_tensor[0]
+        else:
+            self.language_model.set_input_tensor(input_tensor[0])
+
+    def freeze(
+        self,
+        freeze_language_model: bool,
+        freeze_vision_model: bool,
+        freeze_vision_projection: bool,
+        freeze_audio_encoder: bool = False,
+    ):
+        """Freeze model modules."""
+        modules = []
+        if freeze_language_model and self.language_model is not None:
+            modules.append(self.language_model)
+        if freeze_vision_model and self.vision_model is not None:
+            modules.append(self.vision_model)
+        if freeze_vision_projection and self.vision_model is not None:
+            modules.append(self.vision_model.decoder.deepstack_merger_list)
+            modules.append(self.vision_model.merger)
+        if freeze_audio_encoder and self.audio_encoder is not None:
+            modules.append(self.audio_encoder)
+
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = False
+
+        if freeze_vision_model and not freeze_vision_projection:
+            if self.vision_model is not None:
+                for param in self.vision_model.decoder.deepstack_merger_list.parameters():
+                    param.requires_grad = True
+                for param in self.vision_model.merger.parameters():
+                    param.requires_grad = True
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor = None,
+        attention_mask: torch.Tensor = None,
+        labels: torch.Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+        extra_block_kwargs: dict = None,
+        # Visual inputs
+        pixel_values: torch.Tensor = None,
+        pixel_values_videos: torch.Tensor = None,
+        image_grid_thw: torch.Tensor = None,
+        video_grid_thw: torch.Tensor = None,
+        image_input_mask: torch.Tensor = None,
+        cp_img_num: list[int] = None,
+        images_padded: list[bool] = None,
+        # Audio inputs (new for OmniMoe)
+        input_features: torch.Tensor = None,
+        feature_attention_mask: torch.Tensor = None,
+        audio_feature_lengths: torch.Tensor = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        """Forward function of Qwen3OmniMoe Thinker model.
+
+        Args:
+            input_ids: Input text tokens [batch, text_seq_len]
+            position_ids: Position IDs for RoPE
+            attention_mask: Attention mask
+            labels: Target labels for training
+            inference_params: Inference-time parameters
+            packed_seq_params: Parameters for packed sequences
+            extra_block_kwargs: Extra kwargs for transformer blocks
+
+            # Visual
+            pixel_values: Image pixel values
+            pixel_values_videos: Video pixel values
+            image_grid_thw: Image grid sizes
+            video_grid_thw: Video grid sizes
+            image_input_mask: Mask for image positions
+            cp_img_num: Context parallel image numbers
+            images_padded: Images padding info
+
+            # Audio
+            input_features: Audio mel-spectrogram features
+            feature_attention_mask: Mask for audio features
+            audio_feature_lengths: Length of each audio sequence
+
+        Returns:
+            Loss if labels provided, otherwise logits
+        """
+        assert pixel_values_videos is None and video_grid_thw is None, "not support video now"
+        assert inference_params is None, "not support inference"
+
+        video_start_index = 0
+        vision_grid_thw = None
+        vision_data = None
+        image_mask = None
+        deepstack_feature_lists = None
+        cp_size = mpu.get_context_parallel_world_size()
+
+        if self.pre_process:
+            # ========== Process Vision Features ==========
+            if image_grid_thw is not None:
+                image_mask = image_input_mask
+                if image_mask is None:
+                    image_mask = (input_ids == self.image_token_id).contiguous()
+                vision_grid_thw = image_grid_thw
+                vision_data = pixel_values
+                video_start_index = image_mask.sum().item()
+                assert video_start_index > 0
+
+            vision_embeds = None
+            if vision_grid_thw is not None and vision_grid_thw.shape[0] > 0:
+                if cp_size > 1:
+                    if cp_img_num is None:
+                        assert images_padded is None
+                        vision_data, vision_grid_thw, cp_img_num, images_padded = qwen3vl_cp_split(
+                            cp_size,
+                            vision_data,
+                            vision_grid_thw,
+                        )
+                    vision_data, vision_grid_thw, seqlen_on_cp_ranks = get_vision_cp_data(
+                        vision_data,
+                        vision_grid_thw,
+                        self.square_merge_size,
+                        cp_img_num,
+                        images_padded,
+                    )
+                if vision_data.shape[0] > 0:
+                    vision_embeds, deepstack_feature_lists = self.vision_model(
+                        hidden_states=vision_data,
+                        grid_thw=vision_grid_thw,
+                    )
+                else:
+                    vision_embeds = torch.zeros(
+                        (0, self.language_model.config.hidden_size),
+                        device=vision_data.device,
+                        dtype=torch.bfloat16,
+                    )
+                    deepstack_feature_lists = []
+                    for _ in self.vision_model.config.deepstack_visual_indexes:
+                        deepstack_feature_lists.append(
+                            torch.zeros(
+                                (0, self.language_model.config.hidden_size),
+                                device=vision_data.device,
+                                dtype=torch.bfloat16,
+                            )
+                        )
+                if cp_size > 1:
+                    vision_embeds = AllGatherVisionEmbeddings.apply(
+                        vision_embeds,
+                        seqlen_on_cp_ranks,
+                    )
+                    for i in range(len(deepstack_feature_lists)):
+                        deepstack_feature_lists[i] = AllGatherVisionEmbeddings.apply(
+                            deepstack_feature_lists[i],
+                            seqlen_on_cp_ranks,
+                        )
+
+            # ========== Create Combined Embeddings ==========
+            combined_embeddings = self.language_model.embedding(
+                input_ids=input_ids,
+                position_ids=None,  # Disable position embedding here
+            ).clone()
+
+            # ========== Process Audio Features (NEW for OmniMoe) ==========
+            if input_features is not None:
+                audio_embeds = self.audio_encoder(
+                    input_features=input_features,
+                    feature_lens=audio_feature_lengths,
+                )
+
+                # Get audio mask
+                audio_mask = (input_ids == self.audio_token_id).contiguous()
+
+                # Insert audio embeddings
+                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+                combined_embeddings[audio_mask] = audio_embeds
+                combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
+            # ========== Insert Vision Embeddings ==========
+            if vision_embeds is not None:
+                if video_start_index == 0:
+                    image_embeds = None
+                    video_embeds = vision_embeds
+                elif video_start_index == vision_embeds.shape[0]:
+                    image_embeds = vision_embeds
+                    video_embeds = None
+                elif 0 < video_start_index < vision_embeds.shape[0]:
+                    image_embeds = vision_embeds[:video_start_index]
+                    video_embeds = vision_embeds[video_start_index:]
+                else:
+                    raise ValueError(
+                        f"Expect video token start index in range [0, {vision_embeds.shape[0]}], but got "
+                        f"{video_start_index}"
+                    )
+                assert video_embeds is None, "not support video now"
+
+                if image_embeds is not None:
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+                    combined_embeddings[image_mask] = image_embeds
+                    combined_embeddings = combined_embeddings.transpose(0, 1).contiguous()
+
+            # Handle context parallelism
+            if combined_embeddings is not None and cp_size > 1:
+                combined_embeddings = split_data_cp_rank(combined_embeddings, cp_size, 0)
+            if self.config.sequence_parallel:
+                combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(combined_embeddings)
+                combined_embeddings = combined_embeddings.contiguous()
+        else:
+            combined_embeddings = None
+
+        # ========== Generate Position IDs ==========
+        if position_ids is None:
+            position_ids, _ = get_rope_index(
+                self.config.spatial_merge_size,
+                self.image_token_id,
+                self.video_token_id,
+                self.vision_start_token_id,
+                input_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                attention_mask=attention_mask,
+            )
+
+        # Prepare deepstack visual embeds
+        # NOTE: Audio does NOT participate in Deepstack, only visual features
+        visual_pos_masks = image_mask
+        deepstack_visual_embeds = deepstack_feature_lists
+        if self.config.sequence_parallel or cp_size > 1:
+            visual_pos_masks, deepstack_visual_embeds = split_deepstack_embs(
+                visual_pos_masks,
+                deepstack_visual_embeds,
+                tp_size=mpu.get_tensor_model_parallel_world_size(),
+                tp_rank=mpu.get_tensor_model_parallel_rank(),
+                cp_size=cp_size,
+                cp_rank=mpu.get_context_parallel_rank(),
+            )
+
+        # ========== Language Model Forward ==========
+        output = self.language_model(
+            input_ids=None,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=combined_embeddings,
+            labels=labels,
+            inference_params=inference_params,
+            packed_seq_params=packed_seq_params,
+            visual_pos_masks=visual_pos_masks,
+            deepstack_visual_embeds=deepstack_visual_embeds,
+            **(extra_block_kwargs or {}),
+            **kwargs,
+        )
+
+        return output
